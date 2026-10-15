@@ -83,6 +83,18 @@ type RemoteError struct {
 	Code      string
 }
 
+// SessionExpiredError identifies rejected panel authentication. Inference Key
+// failures deliberately remain RemoteError values and never revoke panel login.
+type SessionExpiredError struct{ Cause error }
+
+func (e *SessionExpiredError) Error() string { return "登录已失效，请重新登录" }
+func (e *SessionExpiredError) Unwrap() error { return e.Cause }
+
+func rejectedAuthentication(err error) bool {
+	var remote *RemoteError
+	return errors.As(err, &remote) && (remote.Status == http.StatusUnauthorized || remote.Status == http.StatusForbidden)
+}
+
 func (e *RemoteError) Error() string {
 	switch e.Code {
 	case "INSUFFICIENT_BALANCE":
@@ -92,6 +104,9 @@ func (e *RemoteError) Error() string {
 	}
 	switch e.Status {
 	case 401:
+		if e.Operation == "/v1/models" {
+			return "所选 API Key 无效或已失效，请刷新或更换 Key"
+		}
 		return "登录已失效或凭据无效，请重新登录"
 	case 403:
 		return "当前账号或 Key 无权访问此功能"
@@ -248,10 +263,13 @@ func (s *Session) Remember(save func(string) error) error {
 }
 func (s *Session) refreshToken(ctx context.Context) error {
 	if s.refresh == "" {
-		return errors.New("请重新登录")
+		return &SessionExpiredError{Cause: errors.New("网关未提供可用的刷新令牌")}
 	}
 	var t Tokens
 	if e := s.client.request(ctx, "POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": s.refresh}, &t); e != nil {
+		if rejectedAuthentication(e) {
+			return &SessionExpiredError{Cause: e}
+		}
 		return e
 	}
 	if t.Access == "" {
@@ -280,7 +298,11 @@ func (s *Session) request(ctx context.Context, method, path string, in, out any)
 		if e = s.refreshToken(ctx); e != nil {
 			return e
 		}
-		return s.client.request(ctx, method, path, s.access, in, out)
+		e = s.client.request(ctx, method, path, s.access, in, out)
+		if errors.As(e, &remote) && remote.Status == http.StatusUnauthorized {
+			return &SessionExpiredError{Cause: e}
+		}
+		return e
 	}
 	return e
 }

@@ -27,9 +27,12 @@ package-mac: icons
 	cp build/darwin/AppIcon.icns "bin/SurplusToken Connect.app/Contents/Resources/"
 	cp build/darwin/Info.plist "bin/SurplusToken Connect.app/Contents/Info.plist"
 
-.PHONY: api-dev test
+.PHONY: api-dev test test-e2e
 api-dev:
 	go run ./cmd/connect-dev
 test:
-	go test -race ./internal/...
+	go test -race ./internal/... ./cmd/...
+	npm --prefix frontend test
 	npm --prefix frontend run build
+test-e2e:
+	npm --prefix frontend run test:e2e

@@ -22,6 +22,7 @@ import (
 	"github.com/tidwall/jsonc"
 	"surplustoken-connect/internal/configedit"
 	"surplustoken-connect/internal/discovery"
+	"surplustoken-connect/internal/privatefile"
 )
 
 type Client struct {
@@ -39,18 +40,21 @@ type Change struct {
 	After  string `json:"after"`
 }
 type Plan struct {
-	ID            string          `json:"id"`
-	Client        string          `json:"client"`
-	Path          string          `json:"path"`
-	Changes       []Change        `json:"changes"`
-	Noop          bool            `json:"noop"`
-	Created       time.Time       `json:"created"`
-	Owner         string          `json:"-"`
-	Before, After []byte          `json:"-"`
-	Existed       bool            `json:"-"`
-	Delete        bool            `json:"-"`
-	Patches       []configedit.KV `json:"-"`
-	SourceID      string          `json:"-"`
+	ID             string          `json:"id"`
+	Client         string          `json:"client"`
+	Path           string          `json:"path"`
+	Changes        []Change        `json:"changes"`
+	Noop           bool            `json:"noop"`
+	Created        time.Time       `json:"created"`
+	Owner          string          `json:"-"`
+	Before, After  []byte          `json:"-"`
+	Existed        bool            `json:"-"`
+	Delete         bool            `json:"-"`
+	Patches        []configedit.KV `json:"-"`
+	DeletedFields  []string        `json:"-"`
+	CreatedObjects []string        `json:"-"`
+	SourceID       string          `json:"-"`
+	managed        *managedChange
 }
 type Record struct {
 	ID        string    `json:"id"`
@@ -64,20 +68,24 @@ type Record struct {
 }
 type diskRecord struct {
 	Record
-	Before      []byte   `json:"before_bytes"`
-	After       []byte   `json:"after_bytes"`
-	Existed     bool     `json:"existed"`
-	AfterExists bool     `json:"after_exists"`
-	Fields      []string `json:"fields"`
-	Kind        string   `json:"kind"`
-	SourceID    string   `json:"source_id,omitempty"`
+	Before         []byte         `json:"before_bytes"`
+	After          []byte         `json:"after_bytes"`
+	Existed        bool           `json:"existed"`
+	AfterExists    bool           `json:"after_exists"`
+	Fields         []string       `json:"fields"`
+	Kind           string         `json:"kind"`
+	SourceID       string         `json:"source_id,omitempty"`
+	CreatedObjects []string       `json:"created_objects,omitempty"`
+	Managed        *managedChange `json:"managed,omitempty"`
 }
 type Engine struct {
 	mu    sync.Mutex
 	Store string
 	Paths map[string]string
-	plans map[string]*Plan
-	lock  *flock.Flock
+	// Discover permits fixture mode to avoid probing installed client programs.
+	Discover func() map[string]discovery.Result
+	plans    map[string]*Plan
+	lock     *flock.Flock
 }
 
 func ID() string {
@@ -121,7 +129,7 @@ func New(store string, paths map[string]string) (*Engine, error) {
 	if e := os.MkdirAll(store, 0700); e != nil {
 		return nil, e
 	}
-	if e := os.Chmod(store, 0700); e != nil {
+	if e := privatefile.Directory(store); e != nil {
 		return nil, e
 	}
 	for k, p := range paths {
@@ -135,7 +143,12 @@ func New(store string, paths map[string]string) (*Engine, error) {
 	return e, nil
 }
 func (e *Engine) Detect() []Client {
-	found := discovery.Detect(discovery.Default())
+	var found map[string]discovery.Result
+	if e.Discover != nil {
+		found = e.Discover()
+	} else {
+		found = discovery.Detect(discovery.Default())
+	}
 	out := []Client{}
 	for _, id := range []string{"codex", "claude", "omp", "opencode", "kimi"} {
 		result := found[id]
@@ -255,6 +268,28 @@ func same(a, b gjson.Result) bool {
 func (e *Engine) Plan(owner, client string, patches []configedit.KV) (Plan, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.planLocked(owner, client, patches, "")
+}
+
+// PlanManaged reconciles fields previously written within scope. Fields that
+// disappear from the new template return to their pre-Connect values; unrelated
+// fields and user-created model properties are never claimed or removed.
+func (e *Engine) PlanManaged(owner, client string, patches []configedit.KV, scope string) (Plan, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if scope == "" {
+		return Plan{}, errors.New("受管配置范围不能为空")
+	}
+	var plan Plan
+	err := e.withLock(func() error {
+		var err error
+		plan, err = e.planLocked(owner, client, patches, scope)
+		return err
+	})
+	return plan, err
+}
+
+func (e *Engine) planLocked(owner, client string, patches []configedit.KV, scope string) (Plan, error) {
 	path, ok := e.Paths[client]
 	if !ok || client == "codex" {
 		return Plan{}, errors.New("客户端尚未开放配置写入")
@@ -268,27 +303,50 @@ func (e *Engine) Plan(owner, client string, patches []configedit.KV) (Plan, erro
 			return Plan{}, errors.New("现有 JSON/JSONC 无效或包含重复字段，未修改文件")
 		}
 	}
+	patches = append([]configedit.KV(nil), patches...)
+	var deleted []string
+	var managed *managedChange
+	if scope != "" {
+		patches, deleted, managed, err = e.reconcileManaged(client, scope, raw, patches)
+		if err != nil {
+			return Plan{}, err
+		}
+	}
 	for _, p := range patches {
-		parts := strings.Split(p.Path, ".")
-		for i := 1; i < len(parts); i++ {
-			r := value(raw, strings.Join(parts[:i], "."))
+		for _, ancestor := range configedit.ObjectAncestors(p.Path) {
+			r := value(raw, ancestor)
 			if r.Exists() && !r.IsObject() {
-				return Plan{}, fmt.Errorf("配置字段 %s 不是对象，拒绝覆盖", strings.Join(parts[:i], "."))
+				return Plan{}, fmt.Errorf("配置字段 %s 不是对象，拒绝覆盖", ancestor)
 			}
 		}
 	}
-	after, err := configedit.PatchJSON(raw, patches, nil)
+	after, err := configedit.PatchJSON(raw, patches, deleted)
 	if err != nil {
 		return Plan{}, errors.New("现有 JSON/JSONC 配置无效，未修改文件")
 	}
-	plan := Plan{ID: ID(), Client: client, Path: path, Owner: owner, Before: raw, After: after, Existed: exists, Patches: patches, Created: time.Now(), Changes: []Change{}}
-	for _, p := range patches {
-		before, next := value(raw, p.Path), value(after, p.Path)
+	fields := patchFields(patches, deleted)
+	created := createdObjects(raw, after, fields)
+	if managed != nil {
+		after, err = configedit.PruneEmptyObjects(after, managed.Before.Objects)
+		if err != nil {
+			return Plan{}, errors.New("无法清理旧的受管配置")
+		}
+		managed.After.Objects = survivingObjects(after, append(append([]string(nil), managed.Before.Objects...), created...))
+	}
+	if err := validateJSON(after); err != nil {
+		return Plan{}, errors.New("生成的 JSON/JSONC 配置无效，未修改文件")
+	}
+	plan := Plan{ID: ID(), Client: client, Path: path, Owner: owner, Before: raw, After: after, Existed: exists, Patches: patches, DeletedFields: deleted, CreatedObjects: created, managed: managed, Created: time.Now(), Changes: []Change{}}
+	for _, field := range fields {
+		before, next := value(raw, field), value(after, field)
 		if !same(before, next) {
-			plan.Changes = append(plan.Changes, Change{p.Path, shown(before, p.Path), shown(next, p.Path)})
+			plan.Changes = append(plan.Changes, Change{field, shown(before, field), shown(next, field)})
 		}
 	}
 	plan.Noop = len(plan.Changes) == 0
+	if managed != nil && len(managed.Before.Fields) > 0 && !sameManaged(managed.Before, managed.After) {
+		plan.Noop = false // A released field must also be released in the journal.
+	}
 	for id, p := range e.plans {
 		if time.Since(p.Created) > 10*time.Minute {
 			delete(e.plans, id)
@@ -310,7 +368,7 @@ func atomic(path string, b []byte) error {
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
-	if err = f.Chmod(0600); err == nil {
+	if err = privatefile.File(f); err == nil {
 		_, err = f.Write(b)
 	}
 	if err == nil {
@@ -343,7 +401,7 @@ func (e *Engine) applyLocked(owner, id string) (Record, error) {
 	if !ok || p.Owner != owner || time.Since(p.Created) > 10*time.Minute {
 		return Record{}, errors.New("变更计划已失效，请重新预览")
 	}
-	if p.Noop {
+	if p.Noop && p.SourceID == "" {
 		delete(e.plans, id)
 		return Record{Client: p.Client, Path: p.Path, State: "unchanged", Changes: []Change{}}, nil
 	}
@@ -354,19 +412,28 @@ func (e *Engine) applyLocked(owner, id string) (Record, error) {
 	if hash(cur, exists) != hash(p.Before, p.Existed) {
 		return Record{}, errors.New("配置在预览后被修改，请重新预览")
 	}
-	r := diskRecord{Record: Record{ID: ID(), Client: p.Client, Path: p.Path, At: time.Now(), State: "pending", Changes: p.Changes}, Before: p.Before, After: p.After, Existed: p.Existed, AfterExists: !p.Delete, Kind: "apply", SourceID: p.SourceID}
+	if p.managed != nil {
+		current, err := e.managedStateLocked(p.Client, p.managed.Scope)
+		if err != nil {
+			return Record{}, err
+		}
+		if !sameManaged(current, p.managed.Before) {
+			return Record{}, errors.New("受管配置记录在预览后已变化，请重新预览")
+		}
+	}
+	r := diskRecord{Record: Record{ID: ID(), Client: p.Client, Path: p.Path, At: time.Now(), State: "pending", Changes: p.Changes}, Before: p.Before, After: p.After, Existed: p.Existed, AfterExists: !p.Delete, Kind: "apply", SourceID: p.SourceID, CreatedObjects: p.CreatedObjects, Managed: p.managed}
 	r.Operation = "apply"
 	if p.SourceID != "" {
 		r.Operation = "restore"
 	}
 	r.Backup = filepath.Join(e.Store, r.ID+".json")
-	for _, v := range p.Patches {
-		r.Fields = append(r.Fields, v.Path)
-	}
+	r.Fields = patchFields(p.Patches, p.DeletedFields)
 	if er = e.save(r); er != nil {
 		return Record{}, errors.New("备份失败，未修改配置")
 	}
-	if p.Delete {
+	if p.Noop {
+		// A completed manual restore still needs its ownership/history update.
+	} else if p.Delete {
 		er = os.Remove(p.Path)
 	} else {
 		er = atomic(p.Path, p.After)
@@ -474,6 +541,16 @@ func (e *Engine) History() ([]Record, error) {
 func (e *Engine) Restore(owner, id string) (Plan, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	var plan Plan
+	err := e.withLock(func() error {
+		var err error
+		plan, err = e.restoreLocked(owner, id)
+		return err
+	})
+	return plan, err
+}
+
+func (e *Engine) restoreLocked(owner, id string) (Plan, error) {
 	r, er := e.load(id)
 	if er != nil {
 		return Plan{}, er
@@ -505,8 +582,15 @@ func (e *Engine) Restore(owner, id string) (Plan, error) {
 			return Plan{}, fmt.Errorf("字段 %s 已被其他程序修改，未恢复", f)
 		}
 		if orig.Exists() {
+			for _, ancestor := range configedit.ObjectAncestors(f) {
+				if parent := value(cur, ancestor); parent.Exists() && !parent.IsObject() {
+					return Plan{}, fmt.Errorf("字段 %s 已被其他程序改为非对象，未恢复", ancestor)
+				}
+			}
 			var v any
-			if json.Unmarshal([]byte(orig.Raw), &v) != nil {
+			decoder := json.NewDecoder(strings.NewReader(orig.Raw))
+			decoder.UseNumber()
+			if decoder.Decode(&v) != nil {
 				return Plan{}, errors.New("备份字段无效")
 			}
 			set = append(set, configedit.KV{Path: f, Value: v})
@@ -519,7 +603,41 @@ func (e *Engine) Restore(owner, id string) (Plan, error) {
 	if er != nil {
 		return Plan{}, errors.New("无法生成恢复计划")
 	}
-	p := Plan{ID: ID(), Client: r.Client, Path: r.Path, Owner: owner, Created: time.Now(), Before: cur, After: next, Existed: true, Changes: changes, Noop: len(changes) == 0, SourceID: r.ID}
+	created := r.CreatedObjects
+	if created == nil {
+		created = createdObjects(r.Before, r.After, r.Fields)
+	}
+	next, er = configedit.PruneEmptyObjects(next, created)
+	if er != nil || validateJSON(next) != nil {
+		return Plan{}, errors.New("无法安全清理恢复后的空配置对象")
+	}
+	changes = append(changes, removedObjectChanges(cur, next, created)...)
+	var managed *managedChange
+	scope := ""
+	if r.Managed != nil {
+		scope = r.Managed.Scope
+	} else if r.Client == "opencode" {
+		for _, field := range r.Fields {
+			if within(field, "providers.surplustoken") {
+				scope = "providers.surplustoken"
+				break
+			}
+		}
+	}
+	if scope != "" {
+		current, checkpoint, err := e.managedCheckpointLocked(r.Client, scope, r.ID)
+		if err != nil {
+			return Plan{}, err
+		}
+		if checkpoint == nil || !sameManaged(current, checkpoint.After) {
+			return Plan{}, errors.New("受管配置已有后续变更，请先恢复最近的配置操作")
+		}
+		managed = &managedChange{Scope: scope, Before: current, After: cloneManaged(checkpoint.Before)}
+	}
+	p := Plan{ID: ID(), Client: r.Client, Path: r.Path, Owner: owner, Created: time.Now(), Before: cur, After: next, Existed: true, Changes: changes, Noop: len(changes) == 0, SourceID: r.ID, managed: managed}
+	if managed != nil && !sameManaged(managed.Before, managed.After) {
+		p.Noop = false
+	}
 	if hash(cur, true) == hash(r.After, r.AfterExists) {
 		if r.Existed {
 			p.After = r.Before

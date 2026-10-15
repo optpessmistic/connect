@@ -4,7 +4,7 @@
 
 目标体验：**登录网关 → 获取或创建 API Key → 选择客户端与 Key → 临时启动或永久配置。**
 
-> 当前已接入 SurplusToken 真实登录、用户资料、分组、Key 列表/创建和模型列表。首批永久配置适配器为 Claude Code 与 OpenCode v2，支持脱敏预览、私密备份、写入与按字段恢复；Codex 保持保护，oh-my-pi、Kimi 和临时终端启动待接入。macOS 构建和临时目录联调已验证，Windows 尚未实机验证。
+> 当前已接入 SurplusToken 真实登录、用户资料、分组、Key 列表/创建和模型列表。首批永久配置适配器为 Claude Code 与 OpenCode v2，支持脱敏预览、私密备份、写入与按字段恢复；Codex 保持保护，oh-my-pi、Kimi 和临时终端启动待接入。macOS 构建和临时目录联调已有验证记录；Windows 已通过构建、原生登录页初始化、独立凭据库测试与离线配置/恢复联调，真实客户端推理仍待验收。
 
 五种客户端已接入本机安装与版本检测，包含 GUI 常见安装路径补查、npm 包版本读取和限时版本探测。点击版本号查看详情，和配置适配状态独立展示。Codex 仅做被动安装元数据检查，同时展示 ChatGPT Desktop 应用版本，继续禁止启动或改写。详见 [本机客户端发现](docs/client-discovery.md) 和 [OpenCode v2 升级记录](docs/opencode-v2-migration.md)。
 
@@ -141,7 +141,7 @@ docs/                   调研、设计与实现记录
 
 ## 开发准备与参考源码
 
-本机已验证 Go 1.27.2、Node.js 24.12.0；当前采用 **Wails v3**，Go 模块锁定 `v3.0.0-alpha.63`（`go.mod`），前端 `@wailsio/runtime` 锁定 `3.0.0-beta.28`（`frontend/package-lock.json`）；两者版本号不同，升级时需核对桥接 API 并验证原生调用，前端为 React + TypeScript + Vite。本工程 macOS 编译部署目标为 13.0（不代表已验证最低系统上的 WebKit / Kumo 兼容性），需要 Xcode 开发工具，Windows 构建需要相应的 C 工具链与 WebView2；本轮只验证 macOS 构建。
+已验证 Go 1.27.2、Node.js 24.12.0（macOS）/24.19.0（Windows）；当前采用 **Wails v3**，Go 模块锁定 `v3.0.0-alpha.63`（`go.mod`），前端 `@wailsio/runtime` 锁定 `3.0.0-beta.28`（`frontend/package-lock.json`）；两者版本号不同，升级时需核对桥接 API 并验证原生调用，前端为 React + TypeScript + Vite。本工程 macOS 编译部署目标为 13.0（不代表已验证最低系统上的 WebKit / Kumo 兼容性），需要 Xcode 开发工具。Windows amd64 已在无 C 编译器的环境中完成普通测试与生产构建，运行需要 WebView2；启用 Go race 测试另需兼容 C 工具链。
 
 ```sh
 # 安装依赖
@@ -165,9 +165,26 @@ make build # macOS：包含一致的系统部署目标参数
 make package-mac
 ```
 
-macOS 也可使用 `make run` 一步构建并启动；Windows 完成前端构建后使用 `go build -tags production -trimpath -o bin/surplustoken-connect.exe .`（本轮未验证）。当前无需全局安装 Wails CLI，尚未配置 Go 热重载和发行安装器。界面源码在 `frontend/src/`，桌面入口为 `main.go`。`build/` 平台资源纳入版本控制，`bin/` 和前端产物忽略。
+macOS 也可使用 `make run` 一步构建并启动。Windows 在 Go、Node.js/npm 可从 PATH 找到后使用 PowerShell：
 
-启动自动恢复登录；首次使用或会话过期时显示独立登录页。密码不保存，access token 仅在 Go 内存，refresh token 存入系统凭据库。账号昵称来自用户资料，左下角头像打开账号弹层。默认窗口 880 × 640，最小 820 × 600。Key 仅在 Go 内存与用户确认写入的客户端文件/备份中存在，前端只获得掩码。永久配置的备份可能含原有凭据，按私密文件保存。macOS 使用 Security.framework 钥匙串，Windows 使用 Credential Manager，Windows 尚未实机验证。网页预览仅记住本地开发会话 ID（8 小时、服务重启失效）和账号名，不保存密码或网关令牌。
+```powershell
+# Go 测试、vet、前端回归与生产构建；缺少 C 编译器时明确提示未运行 race
+.\scripts\test-windows.ps1
+# 构建无额外控制台的桌面 exe；已有前端产物时可加 -SkipFrontend
+.\scripts\build-windows.ps1
+# 正常运行
+.\bin\surplustoken-connect.exe
+# 隔离目录检查：禁用系统登录存储和真实客户端检测，WebView2 数据也放在此目录
+.\bin\surplustoken-connect.exe --fixture-dir .\tmp\native-fixture
+# 离线网页联调：另一个终端运行 npm --prefix frontend run dev
+go run ./cmd/connect-dev --fixture-dir .\tmp\ui-fixture --mock
+```
+
+原生 `--fixture-dir` 隔离本机状态，但登录仍访问真实网关；完全离线测试请使用开发服务的 `--mock`。独立 Windows Credential Manager 集成测试可设置 `CONNECT_TEST_CREDENTIAL_STORE=1` 后运行 `go test ./internal/sessionstore`，仅创建并删除随机命名的测试条目。CI 已配置 Windows/macOS 的 race、vet、前端测试与桌面编译；托管 runner 的执行结果见仓库的 GitHub Actions，本地测试结果不替代跨平台 CI 验证。
+
+当前无需全局安装 Wails CLI，尚未配置 Go 热重载和发行安装器。输出 exe 未签名。界面源码在 `frontend/src/`，桌面入口为 `main.go`。`build/` 平台资源纳入版本控制，`bin/` 和前端产物忽略。
+
+启动自动恢复登录；首次使用或会话过期时显示独立登录页。过期后仍可显式清除保存的登录，清除失败保留重试入口。密码不保存，access token 仅在 Go 内存，refresh token 存入系统凭据库。账号昵称来自用户资料，左下角头像打开账号弹层。默认窗口 880 × 640，最小 820 × 600。Key 仅在 Go 内存与用户确认写入的客户端文件/备份中存在，前端只获得掩码。永久配置的备份可能含原有凭据，按私密文件保存。macOS 使用 Security.framework 钥匙串，Windows Credential Manager 已通过独立条目的保存、轮换与删除测试；含秘密文件及备份目录使用限制为当前用户和 SYSTEM 的 Windows DACL。网页预览仅记住本地开发会话 ID（8 小时、服务重启失效）和账号名，不保存密码或网关令牌。
 
 开发 API 只用于 UI 和配置操作，不转发模型推理；桌面包使用原生 Wails Service，复用同一套 API 与配置逻辑，无需运行外部开发服务。测试模式必须显式指定目录：
 
@@ -180,7 +197,24 @@ macOS 也可使用 `make run` 一步构建并启动；Windows 完成前端构建
  make test
 ```
 
-两种测试模式都在主页明确标记“测试目录模式”。真实操作前请核对变更预览中的目标路径。本轮实现范围、接口契约及验证记录见 [API 与配置接入](docs/api-configuration-implementation.md)。
+两种测试模式都在主页明确标记“测试目录模式”，客户端检测使用固定的未安装夹具，不执行本机版本探测。Key 按客户端独立选择，选择本身不写配置，须预览并应用。OpenCode 切换 Key/协议会清理 Connect 先前管理的失效字段，保留用户原有字段、后来追加的属性及注释；用户修改过受管字段时停止并报告冲突。真实操作前请核对变更预览中的目标路径。本轮实现范围、接口契约及验证记录见 [API 与配置接入](docs/api-configuration-implementation.md)。
+
+### 离线界面回归
+
+Go 与 Node.js/npm 可从 PATH 找到后，执行：
+
+```sh
+npm --prefix frontend ci
+# 首次使用安装 Playwright Chromium；测试运行本身仅访问本机
+npm --prefix frontend run test:e2e:install
+npm --prefix frontend run test:e2e
+```
+
+Windows 已安装 Edge 时，也可在 PowerShell 设置 `$env:CONNECT_E2E_CHANNEL='msedge'`，使用独立无头浏览器运行测试，省去 Chromium 下载。测试不会使用日常浏览器个人资料。
+
+`frontend/e2e/` 每条用例自动创建独立的临时配置目录、启动离线网关夹具与开发服务，并在结束时关闭服务及删除临时目录。前端独占 `127.0.0.1:5173`，端口被占用时失败，不复用已有服务；后端使用随机回环端口。覆盖按客户端选择 Key、创建与刷新 Key、Claude/OpenCode 写入与恢复、协议切换、模型重试、写入失败后重新预览，以及过期登录与过时响应。失败截图、trace 和 JSON 结果保存在被 Git 忽略的 `tmp/e2e-results/`。
+
+手动启动离线 API 时，`--listen 127.0.0.1:0` 可自动分配端口；启动完成后输出 `CONNECT_DEV_READY` 和包含实际地址、测试目录、离线模式的 JSON。自定义端口只用于开发服务，原生桌面入口仍走 Wails 桥接。
 
 tf-cli 已作为本地临时参考克隆到 `.references/tf-cli/`，整个 `.references/` 被 Git 忽略，不是子模块或项目依赖。首次克隆可用：
 

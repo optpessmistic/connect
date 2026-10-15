@@ -547,6 +547,7 @@ input, textarea, [contenteditable="true"] {
 .key-status { color:#666; }
 .key-status.enabled { color:#16804a; }
 .key-empty { padding:32px; text-align:center; color:#737373; }
+.key-client-actions { display:flex; flex-direction:column; align-items:flex-start; gap:6px; }
 
 .client-name { display:flex; flex-direction:column; min-width:0; gap:2px; }
 .client-version { font-size:12px; line-height:16px; font-weight:400; color:#737373; white-space:nowrap; }

@@ -7,13 +7,23 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
-type System struct{}
+type System struct {
+	// Tests use a unique namespace, never the application's saved login.
+	serviceName, accountName string
+}
 
 const service = "com.surplustoken.connect.session"
 const account = "https://surplustoken.com"
 
-func (System) Load() (string, error) {
-	token, err := keyring.Get(service, account)
+func (s System) names() (string, string) {
+	if s.serviceName != "" && s.accountName != "" {
+		return s.serviceName, s.accountName
+	}
+	return service, account
+}
+func (s System) Load() (string, error) {
+	serviceName, accountName := s.names()
+	token, err := keyring.Get(serviceName, accountName)
 	if errors.Is(err, keyring.ErrNotFound) {
 		return "", nil
 	}
@@ -22,14 +32,16 @@ func (System) Load() (string, error) {
 	}
 	return token, nil
 }
-func (System) Save(token string) error {
-	if keyring.Set(service, account, token) != nil {
+func (s System) Save(token string) error {
+	serviceName, accountName := s.names()
+	if keyring.Set(serviceName, accountName, token) != nil {
 		return errors.New("无法保存登录状态到系统凭据库")
 	}
 	return nil
 }
-func (System) Delete() error {
-	err := keyring.Delete(service, account)
+func (s System) Delete() error {
+	serviceName, accountName := s.names()
+	err := keyring.Delete(serviceName, accountName)
 	if err != nil && !errors.Is(err, keyring.ErrNotFound) {
 		return errors.New("无法清除系统凭据库中的登录状态")
 	}

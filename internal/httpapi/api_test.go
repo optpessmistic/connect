@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"surplustoken-connect/internal/configuration"
+	"surplustoken-connect/internal/discovery"
 	"surplustoken-connect/internal/gateway"
 	"testing"
 )
@@ -51,6 +52,7 @@ func TestAuthenticatedPlanApplyRestoreAndRedaction(t *testing.T) {
 	g := gateway.New()
 	g.Base = remote.URL
 	api := New(g, engine)
+	engine.Discover = func() map[string]discovery.Result { return map[string]discovery.Result{} }
 	call := func(action, session string, in any) (int, []byte) {
 		b, _ := json.Marshal(in)
 		req := httptest.NewRequest("POST", "/connect/"+action, bytes.NewReader(b))

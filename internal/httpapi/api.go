@@ -27,15 +27,17 @@ type localSession struct {
 	ready   bool
 }
 type API struct {
-	Store     CredentialStore
-	restoreMu sync.Mutex
-	storeMu   sync.Mutex
-	savedID   string
-	Fixture   bool
-	Gateway   *gateway.Client
-	Engine    *configuration.Engine
-	mu        sync.Mutex
-	sessions  map[string]*localSession
+	Store        CredentialStore
+	authMu       sync.Mutex // Serializes login, OTP, resume, logout, and revocation.
+	storeMu      sync.Mutex
+	savedID      string
+	storeVersion uint64
+	clearPending bool
+	Fixture      bool
+	Gateway      *gateway.Client
+	Engine       *configuration.Engine
+	mu           sync.Mutex
+	sessions     map[string]*localSession
 }
 
 func New(g *gateway.Client, e *configuration.Engine) *API {
@@ -133,6 +135,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	action := strings.TrimPrefix(r.URL.Path, "/connect/")
 	id := r.Header.Get("X-Connect-Session")
+	authLocked := action == "login" || action == "login-otp" || action == "resume" || action == "logout"
+	if authLocked {
+		a.authMu.Lock()
+		defer a.authMu.Unlock()
+	}
 	if action == "resume" {
 		a.resume(w, r)
 		return
@@ -172,29 +179,39 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.mu.Lock()
 			delete(a.sessions, id)
 			a.mu.Unlock()
-			fail(w, e)
+			a.failSession(w, id, local, e, authLocked)
 			return
 		}
 		a.remember(id, local, v)
 		respond(w, 200, v)
 		return
 	}
-	s := a.session(id)
-	if s == nil {
-		respond(w, 401, map[string]string{"error": "请先登录"})
-		return
-	}
 	if action == "logout" {
-		if e := a.forgetSaved(id); e != nil {
-			fail(w, e)
+		// The local session may have expired while its refresh token remains in
+		// the OS store. Only the matching nonempty ID can remove saved login.
+		if id == "" {
+			respond(w, 401, map[string]string{"error": "请先登录"})
 			return
 		}
-		_ = s.remote.Logout(r.Context())
 		a.mu.Lock()
+		s := a.sessions[id]
 		delete(a.sessions, id)
 		a.mu.Unlock()
 		a.Engine.Forget(id)
+		cleanupErr := a.forgetSaved(id)
+		if s != nil {
+			_ = s.remote.Logout(r.Context())
+		}
+		if cleanupErr != nil {
+			fail(w, cleanupErr)
+			return
+		}
 		respond(w, 200, map[string]bool{"ok": true})
+		return
+	}
+	s := a.session(id)
+	if s == nil {
+		respond(w, 401, map[string]string{"error": "请先登录"})
 		return
 	}
 	if action == "login-otp" {
@@ -211,7 +228,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 		v, e := a.finishLogin(r.Context(), id, s)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		a.remember(id, s, v)
@@ -229,14 +246,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "session":
 		v, e := a.finishLogin(r.Context(), id, s)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		respond(w, 200, v)
 	case "create-key":
 		groups, e := s.remote.Groups(r.Context())
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		allowed := false
@@ -251,19 +268,19 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		k, e := s.remote.CreateKey(r.Context(), in.GroupID)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		respond(w, 200, k.Public())
 	case "models":
 		k, g, e := a.key(r.Context(), s, in.KeyID)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		models, e := s.remote.Models(r.Context(), k)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		respond(w, 200, map[string]any{"models": models, "group": g, "messages": g.Messages()})
@@ -290,12 +307,12 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		k, g, e := a.key(r.Context(), s, in.KeyID)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		models, e := s.remote.Models(r.Context(), k)
 		if e != nil {
-			fail(w, e)
+			a.failSession(w, id, s, e, authLocked)
 			return
 		}
 		found := false
@@ -361,7 +378,12 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		plan, e := a.Engine.Plan(id, in.Client, patches)
+		var plan configuration.Plan
+		if in.Client == "opencode" {
+			plan, e = a.Engine.PlanManaged(id, in.Client, patches, "providers.surplustoken")
+		} else {
+			plan, e = a.Engine.Plan(id, in.Client, patches)
+		}
 		if e != nil {
 			fail(w, e)
 			return

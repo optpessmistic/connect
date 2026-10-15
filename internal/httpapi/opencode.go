@@ -15,6 +15,8 @@ var modelPattern = regexp.MustCompile(`^[a-zA-Z0-9_.:/-]+$`)
 
 // Native v2 provider format. Models belong to the selected Key, not a global
 // frontend selection. Existing unrelated provider/agent fields remain intact.
+// Apply this template through Engine.PlanManaged so obsolete fields from a prior
+// Key/protocol are released without deleting user-owned model properties.
 func openCodeV2Patches(key gateway.Key, group gateway.Group, models []string) []configedit.KV {
 	pkg := "@opencode/ai/providers/openai-compatible"
 	canonical := ""

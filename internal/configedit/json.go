@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -108,6 +109,45 @@ func splitPath(keyPath string) []string {
 		}
 	}
 	return append(parts, keyPath[start:])
+}
+
+// ObjectAncestors returns the parent object paths without splitting escaped dots
+// in model identifiers. Paths retain their gjson escaping.
+func ObjectAncestors(keyPath string) []string {
+	parts := splitPath(keyPath)
+	parents := make([]string, 0, len(parts)-1)
+	for i := 1; i < len(parts); i++ {
+		parents = append(parents, strings.Join(parts[:i], "."))
+	}
+	return parents
+}
+
+// PruneEmptyObjects removes only explicitly owned empty objects, deepest first.
+// Comments added inside an otherwise empty object count as user content.
+func PruneEmptyObjects(raw []byte, paths []string) ([]byte, error) {
+	ordered := append([]string(nil), paths...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return len(splitPath(ordered[i])) > len(splitPath(ordered[j]))
+	})
+	for _, path := range ordered {
+		body := bytes.TrimPrefix(raw, bom)
+		stripped := jsonc.ToJSON(body)
+		r := gjson.GetBytes(stripped, path)
+		if !r.IsObject() || len(r.Map()) != 0 {
+			continue
+		}
+		// jsonc preserves byte offsets. Do not discard user-added comments.
+		original := body[r.Index : r.Index+len(r.Raw)]
+		if !bytes.Equal(original, stripped[r.Index:r.Index+len(r.Raw)]) {
+			continue
+		}
+		var err error
+		raw, err = PatchJSON(raw, nil, []string{path})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return raw, nil
 }
 
 // unescapeKey is a key path's part as the key it names.

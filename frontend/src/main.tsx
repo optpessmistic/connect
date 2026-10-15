@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Select } from "@cloudflare/kumo/components/select";
@@ -26,7 +26,9 @@ import {
 import "@cloudflare/kumo/styles/standalone";
 import "./style.css";
 import { clients } from "./clients";
-import { native, APIError, hasRememberedSession, clearRememberedSession, request, type User, type Session, type Group, type Key, type DetectedClient, type Catalog, type Plan, type ConfigRecord } from "./api";
+import { native, APIError, StaleRequestError, hasRememberedSession, clearRememberedSession, onSessionExpired, request, type User, type Session, type Group, type Key, type DetectedClient, type Catalog, type Plan, type ConfigRecord } from "./api";
+import { compatibleClientKeys, initialKeySelections, selectClientKey, validKeySelections } from "./key-selection";
+import { AsyncOperations } from "./async-operations";
 
 const navigation = [
   { id: "clients", label: "客户端", icon: SquaresFourIcon },
@@ -41,6 +43,7 @@ const logos: Record<string, string> = {
   kimi: "kimi-color",
 };
 function App() {
+  const operations = useRef(new AsyncOperations());
   const [user, setUser] = useState<User | null>(null);
   const [account, setAccount] = useState(() => { try { return localStorage.getItem("connect-account") || ""; } catch { return ""; } });
   const [page, setPage] = useState("clients");
@@ -56,12 +59,12 @@ function App() {
   const [busy, setBusy] = useState(true);
   const [recovering, setRecovering] = useState(true);
   const [restoreFailed, setRestoreFailed] = useState(false);
+  const [sessionExpired, setSessionExpired] = useState(false);
   const [otpRequired, setOtpRequired] = useState(false);
   const [otp, setOtp] = useState("");
   const [loginError, setLoginError] = useState("");
   const [groups, setGroups] = useState<Group[]>([]);
   const [keys, setKeys] = useState<Key[]>([]);
-  const [keyId, setKeyId] = useState<string | null>(null);
   const [createGroup, setCreateGroup] = useState<string | null>(null);
   const [keySearch, setKeySearch] = useState("");
   const [keyGroupFilter, setKeyGroupFilter] = useState<string | null>("all");
@@ -72,84 +75,169 @@ function App() {
   const [catalogs, setCatalogs] = useState<Record<string,Catalog>>({});
   const [plans, setPlans] = useState<Plan[]>([]);
   const [records, setRecords] = useState<ConfigRecord[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
   const [restoring, setRestoring] = useState(false);
+  const [restoreRecordId, setRestoreRecordId] = useState<string | null>(null);
   const [configurationError, setConfigurationError] = useState("");
+  const [modelError, setModelError] = useState("");
+  const [needsRepreview, setNeedsRepreview] = useState(false);
   const errorText = (error: unknown) => error instanceof Error ? error.message : "操作失败";
   const canConfigure = (id: string) => !!detected.find(c => c.id === id)?.supported;
-  const usableKey = (key: Key) => key.status === "active" && (!key.expires_at || new Date(key.expires_at).getTime() > Date.now());
-  const compatibleKeys = (id: string) => keys.filter(key => usableKey(key) && (id !== "claude" || groups.some(group => group.id === key.group_id && (group.platform === "anthropic" || group.allow_messages_dispatch))) && (id !== "opencode" || groups.some(group => group.id === key.group_id && ["openai","anthropic","deepseek","kimi"].includes(group.platform))));
-  const selectKey = async (id: string) => {
-    setKeyId(id);
-    setClientKeys(previous => {
-      const next = {...previous};
-      for (const client of clients) if (!client.locked && !next[client.id] && compatibleKeys(client.id).some(key => String(key.id) === id)) next[client.id] = id;
-      return next;
-    });
+  const compatibleKeys = (id: string) => compatibleClientKeys(id, keys, groups);
+  const runOperation = async <T,>(
+    name: string,
+    task: () => Promise<T>,
+    success: (result: T) => void,
+    options: {blocking?: boolean; onError?: (error: unknown) => void; onFinish?: () => void} = {},
+  ) => {
+    const operation = operations.current.begin(name, options.blocking ?? true);
+    setBusy(operations.current.busy);
+    try {
+      const result = await task();
+      if (operation.isCurrent()) success(result);
+    } catch (error) {
+      if (operation.isCurrent() && !(error instanceof StaleRequestError)) options.onError?.(error);
+    } finally {
+      if (operation.finish()) options.onFinish?.();
+      // Older operations may finish after a new login started. Recompute from
+      // current owners rather than letting an old finally clear its busy state.
+      setBusy(operations.current.busy);
+    }
   };
-  const acceptSession = async (data: Session) => {
-    setOtpRequired(false); setOtp(""); setFixtureMode(!!data.fixture); setUser(data.user); setGroups(data.groups); setKeys(data.keys); setDetected(data.clients); setPage("clients");
+  const resetLogin = (expired = false, expirationError?: APIError) => {
+    operations.current.reset();
+    setUser(null); setRestoreFailed(native && !!expirationError?.credentialCleanupRequired); setSessionExpired(expired); setRecovering(false);
+    setPassword(""); setShowPassword(false); setOtpRequired(false); setOtp("");
+    setPreview(false); setPlans([]); setRecords([]); setKeys([]); setGroups([]); setDetected([]);
+    setCatalogs({}); setClientKeys({}); setConfiguring(null); setModels({}); setMessage("");
+    setCreateOpen(false); setCreateGroup(null); setRestoring(false); setConfigurationError("");
+    setModelError(""); setNeedsRepreview(false); setRestoreRecordId(null); setHistoryLoading(false); setHistoryError("");
+    setKeySearch(""); setKeyGroupFilter("all"); setKeyStatusFilter("all"); setBusy(false);
+    setLoginError(expired ? expirationError?.credentialCleanupRequired ? expirationError.message : "登录已过期，请重新登录。" : "");
+  };
+  const acceptSession = (data: Session) => {
+    setSessionExpired(false); setOtpRequired(false); setOtp(""); setFixtureMode(!!data.fixture); setUser(data.user); setGroups(data.groups); setKeys(data.keys); setDetected(data.clients); setPage("clients");
     try { localStorage.setItem("connect-account",data.user.email); } catch {}
     setAccount(data.user.email);
-    const available = data.keys.filter(usableKey);
-    setKeyId(available.length === 1 ? String(available[0].id) : null);
-    const initial: Record<string,string> = {};
-    for (const client of clients) {
-      const candidates = available.filter(key => (client.id !== "claude" || data.groups.some(group => group.id === key.group_id && (group.platform === "anthropic" || group.allow_messages_dispatch))) && (client.id !== "opencode" || data.groups.some(group => group.id === key.group_id && ["openai","anthropic","deepseek","kimi"].includes(group.platform))));
-      if (!client.locked && candidates.length === 1) initial[client.id] = String(candidates[0].id);
-    }
+    const initial = initialKeySelections(data.clients.filter(client => client.supported).map(client => client.id), data.keys, data.groups);
     setClientKeys(initial); setCatalogs({}); setModels({}); setConfiguring(null);
-    if (data.warning) setMessage(data.warning);
+    setRecords([]); setMessage(data.warning || "");
   };
   const restoreSession = async () => {
-    setBusy(true); setRecovering(true); setLoginError(""); setRestoreFailed(false);
-    try {
-      if (native || hasRememberedSession()) {
-        const data = await request<Session & {saved?:boolean}>(native ? "resume" : "session");
-        if (data.user) await acceptSession(data);
+    operations.current.reset();
+    setRecovering(true); setLoginError(""); setRestoreFailed(false);
+    if (native || hasRememberedSession()) {
+      await runOperation("auth", () => request<Session & {saved?:boolean}>(native ? "resume" : "session"), data => {
+        if (data.user) acceptSession(data);
         else if (data.warning) setLoginError(data.warning);
-      }
-    } catch(error) {
-      if (error instanceof APIError && error.status === 401) clearRememberedSession();
-      else { setRestoreFailed(true); setLoginError(errorText(error)); }
-    } finally { setRecovering(false); setBusy(false); }
+      }, {
+        onError: error => {
+          if (error instanceof APIError && error.status === 401) {
+            setRestoreFailed(error.credentialCleanupRequired);
+            setLoginError(error.credentialCleanupRequired ? error.message : "登录已过期，请重新登录。");
+          }
+          else { setRestoreFailed(true); setLoginError(errorText(error)); }
+        },
+        onFinish: () => setRecovering(false),
+      });
+    } else { setRecovering(false); setBusy(false); }
   };
+  useEffect(() => onSessionExpired(error => resetLogin(true, error)), []);
   useEffect(() => { void restoreSession(); }, []);
   const login = async () => {
-    setBusy(true); setLoginError("");
-    try {
-      const data = await request<Session>(otpRequired ? "login-otp" : "login", otpRequired ? {code:otp} : {email:account.trim(),password});
-      setPassword(""); setShowPassword(false);
+    operations.current.reset();
+    setLoginError(""); setHistoryLoading(false);
+    await runOperation("auth", () => request<Session>(otpRequired ? "login-otp" : "login", otpRequired ? {code:otp} : {email:account.trim(),password}), data => {
+      setSessionExpired(false); setPassword(""); setShowPassword(false);
       if (data.requires_2fa) { setOtpRequired(true); return; }
-      await acceptSession(data);
-    } catch (error) { setPassword(""); setLoginError(errorText(error)); } finally { setBusy(false); }
+      acceptSession(data);
+    }, {onError: error => { setPassword(""); setLoginError(errorText(error)); }});
   };
-  const refreshHistory = async () => setRecords(await request<ConfigRecord[]>("history"));
+  const logout = async () => {
+    operations.current.reset();
+    setHistoryLoading(false);
+    await runOperation("logout", () => request("logout"), () => resetLogin(), {onError: error => {
+      if (error instanceof APIError && error.credentialCleanupRequired) {
+        resetLogin(true, error);
+      } else if (error instanceof APIError && error.status === 401) {
+        clearRememberedSession();
+        resetLogin();
+      } else if (user) setMessage(errorText(error));
+      else setLoginError(`${errorText(error)}；保存的登录尚未清除，请重试。`);
+    }});
+  };
+  const refreshHistory = () => {
+    setHistoryLoading(true); setHistoryError("");
+    return runOperation("history", () => request<ConfigRecord[]>("history"), setRecords, {
+      blocking: false,
+      onError: error => setHistoryError(errorText(error)),
+      onFinish: () => setHistoryLoading(false),
+    });
+  };
   const loadClientModels = async (client: string, key: string) => {
-    setBusy(true); setConfigurationError(""); setPlans([]);
-    try {
-      const catalog = await request<Catalog>("models",{key_id:Number(key)});
+    const previousModel = clientKeys[client] === key ? models[client] : "";
+    setModelError(""); setConfigurationError(""); setPlans([]); setNeedsRepreview(false);
+    setModels(previous => ({...previous, [client]: ""}));
+    setCatalogs(previous => { const next = {...previous}; delete next[key]; return next; });
+    await runOperation("models", () => request<Catalog>("models",{key_id:Number(key)}), catalog => {
       setCatalogs(previous => ({...previous,[key]:catalog}));
-      setModels(previous => ({...previous,[client]:catalog.models.includes(previous[client]) ? previous[client] : catalog.models.length === 1 ? catalog.models[0] : ""}));
-    } catch(error) { setConfigurationError(errorText(error)); } finally { setBusy(false); }
+      setModels(previous => ({...previous,[client]:catalog.models.includes(previousModel) ? previousModel : catalog.models.length === 1 ? catalog.models[0] : ""}));
+    }, {onError: error => setModelError(errorText(error))});
   };
-  const openConfiguration = async (client: string) => {
-    setConfiguring(client); setRestoring(false); setConfigurationError(""); setPlans([]); setPreview(true);
-    if (clientKeys[client] && client !== "opencode") await loadClientModels(client,clientKeys[client]);
+  const openConfiguration = async (client: string, selectedKey?: string) => {
+    const key = selectedKey ?? clientKeys[client];
+    if (selectedKey) {
+      setClientKeys(previous => selectClientKey(previous, client, selectedKey));
+      setModels(previous => ({...previous, [client]: ""}));
+    }
+    setMode("permanent");
+    setConfiguring(client); setRestoring(false); setRestoreRecordId(null); setConfigurationError(""); setModelError(""); setNeedsRepreview(false); setPlans([]); setPreview(true);
+    if (key && client !== "opencode") await loadClientModels(client,key);
   };
   const prepare = async () => {
     if (!configuring || !clientKeys[configuring] || (configuring !== "opencode" && !models[configuring]) || !canConfigure(configuring)) return;
-    setBusy(true); setConfigurationError("");
-    try { setPlans([await request<Plan>("plan", {client:configuring,model:models[configuring],key_id:Number(clientKeys[configuring]),mode})]); }
-    catch(error) { setConfigurationError(errorText(error)); } finally { setBusy(false); }
+    setConfigurationError("");
+    await runOperation("plan", () => request<Plan>("plan", {client:configuring,model:models[configuring],key_id:Number(clientKeys[configuring]),mode}), plan => {
+      setPlans([plan]); setNeedsRepreview(false);
+    }, {onError: error => setConfigurationError(errorText(error))});
+  };
+  const previewRestore = async (recordId: string) => {
+    setRestoring(true); setRestoreRecordId(recordId); setConfiguring(null);
+    setConfigurationError(""); setModelError(""); setPlans([]); setPreview(true);
+    await runOperation("plan", () => request<Plan>("restore", {record_id:recordId}), plan => {
+      setPlans([plan]); setNeedsRepreview(false);
+    }, {onError: error => { setConfigurationError(errorText(error)); setNeedsRepreview(true); }});
   };
   const apply = async () => {
-    setBusy(true); const results: string[] = [];
-    for (const plan of plans) {
-      try { const result = await request<ConfigRecord>("apply", {plan_id:plan.id}); results.push(`${clients.find(c => c.id === plan.client)?.name}：${result.state === "unchanged" ? "配置未变化" : restoring ? "已恢复" : "已写入，请重新打开客户端"}`); }
-      catch(error) { results.push(`${clients.find(c => c.id === plan.client)?.name}：${errorText(error)}`); }
-    }
-    setMessage(results.join("；")); setPreview(false); setPlans([]); setBusy(false);
-    if (page === "history") { try { await refreshHistory(); } catch(error) { setMessage(errorText(error)); } }
+    const plan = plans[0];
+    if (!plan) return;
+    setConfigurationError("");
+    await runOperation("apply", () => request<ConfigRecord>("apply", {plan_id:plan.id}), result => {
+      setMessage(`${clients.find(c => c.id === plan.client)?.name}：${result.state === "unchanged" ? "配置未变化" : restoring ? "已恢复" : "已写入，请重新打开客户端"}`);
+      setPreview(false); setPlans([]); setNeedsRepreview(false);
+      if (page === "history") void refreshHistory();
+    }, {onError: error => {
+      setConfigurationError(`${errorText(error)}。请重新预览，确认当前文件状态后再应用。`);
+      setPlans([]); setNeedsRepreview(true);
+      if (page === "history") void refreshHistory();
+    }});
+  };
+  const detectClients = () => runOperation("detect", () => request<DetectedClient[]>("detect"), setDetected, {onError: error => setMessage(errorText(error))});
+  const refreshKeys = () => {
+    setMessage("");
+    return runOperation("keys", () => request<Session>("session"), data => {
+      setKeys(data.keys); setGroups(data.groups); setDetected(data.clients);
+      setClientKeys(previous => validKeySelections(previous, data.clients.filter(client => client.supported).map(client => client.id), data.keys, data.groups));
+      setCatalogs({}); setModels({}); setPlans([]);
+    }, {onError: error => setMessage(errorText(error))});
+  };
+  const createKey = () => {
+    if (!createGroup) return;
+    setMessage("");
+    return runOperation("create-key", () => request<Key>("create-key", {group_id:Number(createGroup)}), key => {
+      setKeys(previous => [...previous,key]); setCreateOpen(false); setMessage("密钥已创建，请选择要配置的客户端。");
+    }, {onError: error => setMessage(errorText(error))});
   };
   const temporary = mode === "temporary";
   const go = (next: string) => {
@@ -157,7 +245,7 @@ function App() {
     setPassword("");
     setShowPassword(false);
     setMessage("");
-    if (next === "history") void refreshHistory().catch(error => setMessage(errorText(error)));
+    if (next === "history") void refreshHistory();
   };
   if (user === null) {
     return (
@@ -210,6 +298,7 @@ function App() {
             </InputGroup>}
             {otpRequired && <Input label="验证码" value={otp} onChange={e => setOtp(e.target.value)} inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="one-time-code" required />}
             {loginError && <p className="login-error" role="alert">{loginError}</p>}
+            {sessionExpired && <Button type="button" disabled={busy} onClick={() => void logout()}>{native ? "清除保存的登录" : "清除已过期会话"}</Button>}
             {restoreFailed && <Button type="button" disabled={busy} onClick={() => void restoreSession()}>重试恢复登录</Button>}
             <Button disabled={busy} type="submit" variant="primary" className="login-button">
               {busy ? "登录中…" : otpRequired ? "验证并登录" : "登录"}
@@ -274,11 +363,7 @@ function App() {
                   <Button
                     variant="ghost"
                     icon={SignOutIcon}
-                    onClick={async () => {
-                      setBusy(true);
-                      try { await request("logout"); } catch(error) { setMessage(errorText(error)); setBusy(false); return; }
-                      setUser(null); setRestoreFailed(false); setAccount(user.email); setPassword(""); setShowPassword(false); setPreview(false); setPlans([]); setKeys([]); setGroups([]); setCatalogs({}); setClientKeys({}); setKeyId(null); setConfiguring(null); setModels({}); setMessage(""); setBusy(false);
-                    }}
+                    onClick={() => void logout()}
                   >
                     退出登录
                   </Button>
@@ -294,7 +379,7 @@ function App() {
               <Button
                 icon={ClockCounterClockwiseIcon}
                 disabled={busy}
-                onClick={async () => { setBusy(true); try { setDetected(await request<DetectedClient[]>("detect")); } catch(error) { setMessage(errorText(error)); } finally { setBusy(false); } }}
+                onClick={() => void detectClients()}
               >
                 检测客户端
               </Button>
@@ -368,11 +453,7 @@ function App() {
             {page === "keys" && (
               <section className="key-management">
                 <div className="key-toolbar">
-                  <Button aria-label="刷新密钥" icon={ArrowClockwiseIcon} disabled={busy} onClick={async () => {
-                    setBusy(true); setMessage("");
-                    try { const data = await request<Session>("session"); setKeys(data.keys); setGroups(data.groups); setClientKeys(previous => Object.fromEntries(Object.entries(previous).filter(([,id]) => data.keys.some(key => String(key.id) === id && usableKey(key))))); if (!data.keys.some(k => String(k.id) === keyId)) setKeyId(null); }
-                    catch(error) { setMessage(errorText(error)); } finally { setBusy(false); }
-                  }} />
+                  <Button aria-label="刷新密钥" icon={ArrowClockwiseIcon} disabled={busy} onClick={() => void refreshKeys()} />
                   <Button variant="primary" icon={PlusIcon} disabled={busy} onClick={() => setCreateOpen(!createOpen)}>创建密钥</Button>
                 </div>
                 <div className="key-filters">
@@ -382,16 +463,12 @@ function App() {
                 </div>
                 {createOpen && <section className="create-key-row">
                   <Select<string> label="分组" placeholder="选择分组" value={createGroup} items={Object.fromEntries(groups.filter(g => g.status === "active").map(g => [String(g.id),g.name]))} onValueChange={setCreateGroup} alignItemWithTrigger={false} />
-                  <Button disabled={busy || !createGroup} onClick={async () => {
-                    setBusy(true); setMessage("");
-                    try { const key = await request<Key>("create-key", {group_id:Number(createGroup)}); setKeys(previous => [...previous,key]); setCreateOpen(false); await selectKey(String(key.id)); }
-                    catch(error) { setMessage(errorText(error)); } finally { setBusy(false); }
-                  }}>确认创建</Button>
+                  <Button disabled={busy || !createGroup} onClick={() => void createKey()}>确认创建</Button>
                 </section>}
                 <div className="key-table-wrap">
                   <Table aria-label="API 密钥列表">
                     <Table.Header><Table.Row>
-                      <Table.Head>名称</Table.Head><Table.Head>API 密钥</Table.Head><Table.Head>分组</Table.Head><Table.Head>过期时间</Table.Head><Table.Head>状态</Table.Head><Table.Head>操作</Table.Head>
+                      <Table.Head>名称</Table.Head><Table.Head>API 密钥</Table.Head><Table.Head>分组</Table.Head><Table.Head>过期时间</Table.Head><Table.Head>状态</Table.Head><Table.Head>用于配置</Table.Head>
                     </Table.Row></Table.Header>
                     <Table.Body>{keys.filter(key => {
                       const expired = !!key.expires_at && new Date(key.expires_at).getTime() <= Date.now();
@@ -400,28 +477,31 @@ function App() {
                     }).map(key => {
                       const expired = !!key.expires_at && new Date(key.expires_at).getTime() <= Date.now();
                       const active = key.status === "active" && !expired;
-                      const current = String(key.id) === keyId;
-                      return <Table.Row key={key.id} variant={current ? "selected" : "default"}>
+                      const targets = clients.filter(client => !client.locked && canConfigure(client.id) && compatibleKeys(client.id).some(candidate => candidate.id === key.id));
+                      return <Table.Row key={key.id}>
                         <Table.Cell><span className="key-name" title={key.name}>{key.name}</span></Table.Cell>
                         <Table.Cell><code className="key-mask">{key.mask}</code></Table.Cell>
                         <Table.Cell><span className="tag">{groups.find(g => g.id === key.group_id)?.name ?? "—"}</span></Table.Cell>
                         <Table.Cell><span className="key-expiry" title={key.expires_at ? new Date(key.expires_at).toLocaleString("zh-CN") : undefined}>{key.expires_at ? new Date(key.expires_at).toLocaleDateString("zh-CN") : "永不过期"}</span></Table.Cell>
                         <Table.Cell><span className={`key-status ${active ? "enabled" : ""}`}>{expired ? "已过期" : active ? "启用" : key.status === "disabled" ? "禁用" : key.status}</span></Table.Cell>
-                        <Table.Cell><Button disabled={busy || !active} onClick={() => void selectKey(String(key.id))}>{current ? "当前使用" : "使用密钥"}</Button></Table.Cell>
+                        <Table.Cell><div className="key-client-actions">{targets.length ? targets.map(client => <Button key={client.id} disabled={busy} aria-label={`${key.name} 用于配置 ${client.name}`} onClick={() => void openConfiguration(client.id, String(key.id))}>{client.name}{clientKeys[client.id] === String(key.id) ? " · 已选择" : ""}</Button>) : <span className="key-status">{active ? "无兼容客户端" : "不可用"}</span>}</div></Table.Cell>
                       </Table.Row>;
                     })}</Table.Body>
                   </Table>
                   {!keys.length && <p className="key-empty">还没有 API 密钥</p>}
                 </div>
                 <p className="preview-note">共 {keys.length} 个密钥</p>
+                <p className="preview-note">每个客户端分别选择 Key；“已选择”表示本次配置选择，预览并应用后才会写入。</p>
               </section>
             )}
-            {page === "history" && (
-              records.length ? <div className="history-list">{records.map(record => <section className="panel history-record" key={record.id}>
+            {page === "history" && <>
+              {historyLoading && <p role="status">正在加载配置记录…</p>}
+              {historyError && <section className="panel"><p className="login-error" role="alert">{historyError}</p><Button disabled={busy || historyLoading} onClick={() => void refreshHistory()}>重试加载记录</Button></section>}
+              {!historyLoading && !historyError && (records.length ? <div className="history-list">{records.map(record => <section className="panel history-record" key={record.id}>
                 <div><strong>{clients.find(c => c.id === record.client)?.name} · {record.operation === "restore" && record.state === "applied" ? "已恢复" : ({applied:"已写入",pending:"待恢复",failed:"失败",conflict:"有冲突",reverted:"已撤回"} as Record<string,string>)[record.state] ?? record.state}</strong><p>{new Date(record.at).toLocaleString("zh-CN")}</p><p className="config-path">{record.path}</p></div>
-                <Button disabled={busy || record.state !== "applied" || record.operation === "restore"} onClick={async () => { setBusy(true); try { const plan = await request<Plan>("restore",{record_id:record.id}); setPlans([plan]); setRestoring(true); setPreview(true); } catch(error) { setMessage(errorText(error)); } finally { setBusy(false); } }}>恢复修改</Button>
-              </section>)}</div> : <section className="panel empty-state"><ClockCounterClockwiseIcon size={28} /><h2>还没有配置记录</h2><Button onClick={() => go("clients")}>去配置客户端 <ArrowRightIcon /></Button></section>
-            )}
+                <Button disabled={busy || record.state !== "applied" || record.operation === "restore"} onClick={() => void previewRestore(record.id)}>恢复修改</Button>
+              </section>)}</div> : <section className="panel empty-state"><ClockCounterClockwiseIcon size={28} /><h2>还没有配置记录</h2><Button onClick={() => go("clients")}>去配置客户端 <ArrowRightIcon /></Button></section>)}
+            </>}
             {page === "settings" && (
               <section className="panel">
                 <h2>应用偏好</h2>
@@ -489,12 +569,17 @@ function App() {
         </div>
         {!restoring && <div className="preview-models">{targets.map(client => <div key={client}>
           <Select<string> label={`${clients.find(item => item.id === client)?.name} API Key`} value={clientKeys[client] || null} placeholder={compatibleKeys(client).length ? "选择 API Key" : "没有兼容 Key"} disabled={busy} items={Object.fromEntries(compatibleKeys(client).map(key => [String(key.id),`${key.name} · ${key.mask}`]))} onValueChange={key => {
-            setClientKeys(previous => ({...previous,[client]:key || ""})); setModels(previous => ({...previous,[client]:""})); setPlans([]);setConfigurationError("");
+            setClientKeys(previous => selectClientKey(previous, client, key || "")); setModels(previous => ({...previous,[client]:""})); setPlans([]); setConfigurationError(""); setModelError(""); setNeedsRepreview(false);
             if (key && client !== "opencode") void loadClientModels(client,key);
           }} alignItemWithTrigger={false} />
           {!compatibleKeys(client).length && <Button onClick={() => {setPreview(false);go("keys");}}>管理 API Key <ArrowRightIcon /></Button>}
-          {client !== "opencode" && <Select<string> label={`${clients.find(item => item.id === client)?.name} 默认模型`} value={models[client] || null} placeholder="选择默认模型" disabled={busy || !clientKeys[client]} items={Object.fromEntries((catalogs[clientKeys[client]]?.models ?? []).map(model => [model,model]))} onValueChange={model => {setModels(previous => ({...previous,[client]:model || ""}));setPlans([]);}} alignItemWithTrigger={false} />}
+          {client !== "opencode" && <Select<string> label={`${clients.find(item => item.id === client)?.name} 默认模型`} value={models[client] || null} placeholder="选择默认模型" disabled={busy || !clientKeys[client]} items={Object.fromEntries((catalogs[clientKeys[client]]?.models ?? []).map(model => [model,model]))} onValueChange={model => {setModels(previous => ({...previous,[client]:model || ""}));setPlans([]);setNeedsRepreview(false);setConfigurationError("");}} alignItemWithTrigger={false} />}
+          {client !== "opencode" && !busy && !modelError && catalogs[clientKeys[client]]?.models.length === 0 && <p role="status">当前 Key 没有可用模型，请更换 Key 或稍后重新加载。</p>}
         </div>)}</div>}
+        {!restoring && configuring && configuring !== "opencode" && (modelError || catalogs[clientKeys[configuring]]?.models.length === 0) && <div>
+          {modelError && <p className="login-error" role="alert">{modelError}</p>}
+          <Button disabled={busy || !clientKeys[configuring]} onClick={() => void loadClientModels(configuring, clientKeys[configuring])}>重试加载模型</Button>
+        </div>}
         {configurationError && <p className="login-error" role="alert">{configurationError}</p>}
         {plans.length > 0 && <div className="plan-list">
           {plans.map(plan => <div className="plan-item" key={plan.id}>
@@ -515,8 +600,8 @@ function App() {
           <Dialog.Close
             render={(props) => <Button {...props}>返回调整</Button>}
           />
-          <Button variant="primary" disabled={busy || (!restoring && targets.some(client => !clientKeys[client] || (client !== "opencode" && !models[client])))} onClick={() => void (plans.length ? apply() : prepare())}>
-            {busy ? "处理中…" : restoring ? "确认恢复" : plans.length ? "应用配置" : "预览配置变更"}
+          <Button variant="primary" disabled={busy || (restoring ? !restoreRecordId : !configuring || targets.some(client => !clientKeys[client] || (client !== "opencode" && !models[client])))} onClick={() => void (plans.length ? apply() : restoring && restoreRecordId ? previewRestore(restoreRecordId) : prepare())}>
+            {busy ? "处理中…" : plans.length ? restoring ? "确认恢复" : "应用配置" : needsRepreview ? "重新预览" : restoring ? "预览恢复变更" : "预览配置变更"}
           </Button>
         </div>
       </Dialog>

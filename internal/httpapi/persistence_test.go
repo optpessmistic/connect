@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"surplustoken-connect/internal/configuration"
+	"surplustoken-connect/internal/discovery"
 	"surplustoken-connect/internal/gateway"
 	"testing"
 )
@@ -55,6 +56,7 @@ func TestRememberResumeRotationLogoutAndTransientFailure(t *testing.T) {
 	defer remote.Close()
 	root, _ := filepath.EvalSymlinks(t.TempDir())
 	engine, _ := configuration.New(filepath.Join(root, "backups"), map[string]string{})
+	engine.Discover = func() map[string]discovery.Result { return map[string]discovery.Result{} }
 	store := &memoryCredentialStore{}
 	makeAPI := func() *API { g := gateway.New(); g.Base = remote.URL; a := New(g, engine); a.Store = store; return a }
 	call := func(api *API, action, id, body string) BridgeResponse {
