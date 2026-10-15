@@ -3,6 +3,7 @@
 package configuration
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,24 +19,87 @@ func assertPrivateACL(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	control, _, err := sd.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
-		t.Fatal("secret file inherits parent permissions")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
 	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := sd.String()
-	if strings.Count(text, "(A;") != 2 || strings.Count(text, ";FA;") != 2 || !strings.Contains(text, ";;;"+user.User.Sid.String()+")") || !strings.Contains(text, ";;;SY)") {
-		t.Fatalf("unexpected secret-file ACL: %s", text)
+	if err := validatePrivateACL(sd, user.User.Sid, info.IsDir()); err != nil {
+		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
+}
+
+func validatePrivateACL(sd *windows.SECURITY_DESCRIPTOR, user *windows.SID, directory bool) error {
+	control, _, err := sd.Control()
+	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		return fmt.Errorf("secret file inherits parent permissions")
+	}
+	flags := ""
+	if directory {
+		flags = "OICI"
+	}
+	// Windows may render a numeric SID as an SDDL alias (for example LA for
+	// the built-in Administrator used by CI). Canonicalize both descriptors
+	// before comparing their complete ACE lists. Keep the protected-DACL check
+	// separate because filesystems may also set the auto-inherited control bit.
+	expected, err := windows.SecurityDescriptorFromString("D:P(A;" + flags + ";FA;;;" + user.String() + ")(A;" + flags + ";FA;;;SY)")
+	if err != nil {
+		return err
+	}
+	actualText, expectedText := sd.String(), expected.String()
+	actualStart, expectedStart := strings.Index(actualText, "("), strings.Index(expectedText, "(")
+	if actualStart < 0 || expectedStart < 0 || actualText[actualStart:] != expectedText[expectedStart:] {
+		return fmt.Errorf("unexpected secret-file ACL: %s", actualText)
+	}
+	return nil
+}
+
+func TestWindowsPrivateACLAcceptsEquivalentSIDRepresentations(t *testing.T) {
+	// Resolve LA without changing the test process identity or machine accounts.
+	owner, err := windows.SecurityDescriptorFromString("O:LA")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.IsDir() && strings.Count(text, "OICI") != 2 {
-		t.Fatal("private directory does not protect child files")
+	admin, _, err := owner.Owner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, sddl := range map[string]string{
+		"alias":   "D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)",
+		"numeric": "D:P(A;OICI;FA;;;" + admin.String() + ")(A;OICI;FA;;;SY)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			sd, err := windows.SecurityDescriptorFromString(sddl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validatePrivateACL(sd, admin, true); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for name, sddl := range map[string]string{
+		"extra_reader":  "D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)",
+		"wrong_user":    "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+		"read_only":     "D:P(A;OICI;FR;;;LA)(A;OICI;FA;;;SY)",
+		"missing_oi":    "D:P(A;CI;FA;;;LA)(A;OICI;FA;;;SY)",
+		"missing_ci":    "D:P(A;OI;FA;;;LA)(A;OICI;FA;;;SY)",
+		"unprotected":   "D:(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)",
+		"missing_ace":   "D:P(A;OICI;FA;;;LA)",
+		"duplicate_ace": "D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;LA)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			sd, err := windows.SecurityDescriptorFromString(sddl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validatePrivateACL(sd, admin, true); err == nil {
+				t.Fatal("invalid private ACL was accepted")
+			}
+		})
 	}
 }
 
